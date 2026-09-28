@@ -1,8 +1,10 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from tools import TOOLS_SCHEMA, AVAILABLE_TOOLS
 from llm_client import OllamaError
 from llm_client import chat_send
+from llm_client import chat_stream
 import json
 
 app = FastAPI()
@@ -49,3 +51,39 @@ async def chat_endpoint(request: ChatRequest):
         return ChatReply(reply=content)
     except OllamaError as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+@app.post("/chat/stream")
+async def chat_stream_endpoint(request: ChatRequest):
+    messages = [{"role": "user", "content": request.message}]
+
+    async def event_generator():
+        tool_calls_result = None
+
+        async for event in chat_stream(messages, tools=TOOLS_SCHEMA):
+            if event["type"] == "content":
+                yield f"data: {json.dumps({'content': event['data']})}\n\n"
+            elif event["type"] == "tool_calls":
+                tool_calls_result = event["data"]
+
+        if tool_calls_result:
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": tc["id"], "type": "function",
+                     "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                    for tc in tool_calls_result
+                ],
+            })
+            for tc in tool_calls_result:
+                resultat = AVAILABLE_TOOLS[tc["name"]](**json.loads(tc["arguments"]))
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": resultat})
+
+            # 2e appel, en streaming, sans tools : c'est la réponse finale
+            async for event in chat_stream(messages):
+                if event["type"] == "content":
+                    yield f"data: {json.dumps({'content': event['data']})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
